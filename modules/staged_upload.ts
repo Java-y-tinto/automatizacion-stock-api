@@ -1,6 +1,9 @@
 import { graphql } from "./functions";
 
-export async function subirArchivoShopify(path: string) {
+export const PRODUCT_SET_MUTATION = "mutation productSet($input: ProductSetInput!) { productSet(input: $input) { product { id } userErrors { field message } } }";
+export const PRODUCT_DELETE_MUTATION = "mutation productDelete($input: ProductDeleteInput!) { productDelete(input: $input) { deletedProductId userErrors { field message } } }";
+
+export async function subirArchivoShopify(path: string, mutation = PRODUCT_SET_MUTATION) {
   const stat = Bun.file(path);
   const nombreArchivo = path.split('/').pop();
   if (!nombreArchivo) throw new Error("No se pudo obtener el nombre del archivo");
@@ -47,10 +50,10 @@ export async function subirArchivoShopify(path: string) {
   // Ejecutamos el bulk mutation
 
   const mutationBulk = `
-        mutation bulkOperationRunMutation($stagedUploadPath: String!) {
+        mutation bulkOperationRunMutation($stagedUploadPath: String!, $mutation: String!) {
           bulkOperationRunMutation(
             stagedUploadPath: $stagedUploadPath,
-            mutation: "mutation productSet($input: ProductSetInput!) { productSet(input: $input) { product { id } userErrors { field message } } }"
+            mutation: $mutation
           ) {
             bulkOperation { id status }
             userErrors { field message }
@@ -59,7 +62,8 @@ export async function subirArchivoShopify(path: string) {
     `;
 
   const bulkResult = await graphql(mutationBulk, {
-    stagedUploadPath: target.resourceUrl
+    stagedUploadPath: target.resourceUrl,
+    mutation
   });
 
   if (bulkResult.bulkOperationRunMutation.userErrors.length > 0) {
@@ -158,7 +162,7 @@ export async function verErroresBulk(bulkOperationId: string) {
     const errors = lineas.filter(line => {
       try {
         const json = JSON.parse(line);
-        return json.data?.productSet?.userErrors?.length > 0;
+        return Object.values(json.data ?? {}).some((r: any) => r?.userErrors?.length > 0);
       } catch {
         return false;
       }

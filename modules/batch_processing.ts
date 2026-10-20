@@ -1,9 +1,13 @@
 import type { BunFile } from "bun";
-import type { AstelavSearchResponse, AstelavStockResponse, PricingRule } from "../types";
+import type { AstelavSearchResponse, AstelavStockDetails, AstelavStockResponse, PricingRule } from "../types";
 import { processAstelavImages } from "./images";
 import { graphql } from "./functions";
 
 const MINUTES = 1400;
+// Coleccion "SSPELECTRONIC DROPS": solo estos productos vienen de Astelav, el resto de la tienda no se toca
+const ASTELAV_COLLECTION_ID = "gid://shopify/Collection/699687862659";
+// Limite de SKUs por fase para pruebas (MAX_SKUS=50); sin definir = todos
+const MAX_SKUS = Number(process.env.MAX_SKUS) || Infinity;
 const CUSTOMER_ID = process.env.ASTELAV_CUSTOMER_ID?.trim();
 const API_TOKEN = (process.env.environment! == "TEST") ? process.env.ASTELAV_TEST_API_TOKEN?.trim() : process.env.ASTELAV_LIVE_API_TOKEN?.trim();
 const LOCATION_ID = process.env.SHOPIFY_LOCATION_ID?.trim();
@@ -72,6 +76,13 @@ export async function obtenerMapaProductos() {
                         }
                       }
                     }
+                    collections {
+                      edges {
+                        node {
+                          id
+                        }
+                      }
+                    }
                   }
                 }
               }
@@ -134,18 +145,23 @@ export async function obtenerMapaProductos() {
     const text = await response.text();
     const lineas = text.split('\n').filter(line => line.trim() !== '');
 
-    for (const linea of lineas) {
-        const data = JSON.parse(linea);
-        // Shopify Bulk API devuelve las variantes con el campo __parentId que apunta al ID del producto
+    // Shopify Bulk API devuelve variantes y colecciones como lineas con __parentId = ID del producto,
+    // sin orden garantizado, asi que primero sacamos los productos de Astelav
+    const datos = lineas.map(linea => JSON.parse(linea));
+    const productosAstelav = new Set(
+        datos.filter(d => d.id === ASTELAV_COLLECTION_ID && d.__parentId).map(d => d.__parentId)
+    );
+    for (const data of datos) {
         if (data.sku && data.__parentId) {
             mapa.set(data.sku, {
                 productId: data.__parentId,
-                variantId: data.id
+                variantId: data.id,
+                astelav: productosAstelav.has(data.__parentId)
             });
         }
     }
 
-    console.log(`Diccionario listo: ${mapa.size} productos encontrados en Shopify.`);
+    console.log(`Diccionario listo: ${mapa.size} productos encontrados en Shopify (${productosAstelav.size} de Astelav).`);
     return mapa;
 }
 
@@ -216,6 +232,54 @@ const pricingRules: PricingRule[] = [
     }
 ]
 
+// Limpieza de stock ("25+" -> 25)
+function limpiarStock(infoStock?: AstelavStockDetails): number {
+    const rawQuantity = infoStock?.stock?.availableQuantity || 0;
+    return typeof rawQuantity === 'string'
+        ? parseInt(rawQuantity.replace(/\D/g, ''), 10) || 0
+        : rawQuantity;
+}
+
+// Precio de coste -> precio de venta con margen e IVA (0 si no hay precio)
+function calcularPrecioFinal(price: AstelavStockDetails["price"] | undefined): number {
+    const precioBaseFloat = parseFloat(String(price ?? "")) || 0;
+    const rule = pricingRules.find(r => precioBaseFloat <= r.maxCost);
+    const porcentaje = rule?.incrementPercentage ?? 0;
+    const precioFinal = Math.ceil(precioBaseFloat * (1 + porcentaje / 100));
+    const IVA = 0.21;
+    return parseFloat((precioFinal * (1 + IVA)).toFixed(2));
+}
+
+// Producto ya existente en Shopify: solo actualizamos precio y stock (sin llamar a search)
+export function transformStockUpdateJSONL(
+    sku: string,
+    stockData: AstelavStockResponse,
+    datosPrevios: { productId: string, variantId: string }
+): string {
+    const infoStock = stockData[sku];
+    const quantity = limpiarStock(infoStock);
+    const precio = calcularPrecioFinal(infoStock?.price);
+
+    return JSON.stringify({
+        input: {
+            id: datosPrevios.productId,
+            productOptions: [{ name: "Title", values: [{ name: "Default Title" }] }],
+            variants: [{
+                id: datosPrevios.variantId,
+                sku: sku,
+                // Sin precio valido mantenemos el que ya tiene en Shopify
+                ...(precio > 0 ? { price: String(precio) } : {}),
+                optionValues: [{ optionName: "Title", name: "Default Title" }],
+                inventoryItem: { tracked: true },
+                inventoryQuantities: [{
+                    locationId: `gid://shopify/Location/${LOCATION_ID}`,
+                    name: "available",
+                    quantity
+                }]
+            }]
+        }
+    });
+}
 
 // la API nos devuelve la informacion sucia, la limpiamos con esta funcion
 
@@ -238,10 +302,7 @@ export async function transformToShopifyJSONL(
     }
 
     // 3. Limpieza de stock ("25+" -> 25)
-    const rawQuantity = infoStock.stock?.availableQuantity || 0;
-    const cleanQuantity = typeof rawQuantity === 'string'
-        ? parseInt(rawQuantity.replace(/\D/g, ''), 10) || 0
-        : rawQuantity;
+    const cleanQuantity = limpiarStock(infoStock);
 
     // Descartar si el stock no es mayor que 0
     if (cleanQuantity <= 0) {
@@ -260,17 +321,7 @@ export async function transformToShopifyJSONL(
         .replace(/[^a-z0-9]+/g, '-')
         .replace(/(^-|-$)/g, '');
 
-    // Asegurar precio válido
-    const precioBase = infoStock.price !== undefined && infoStock.price !== ""
-        ? String(infoStock.price)
-        : "0.00";
-    const precioBaseFloat = parseFloat(precioBase);
-
-    const rule = pricingRules.find(r => precioBaseFloat <= r.maxCost);
-    const porcentaje = rule?.incrementPercentage ?? 0;
-    const precioFinal = Math.ceil(precioBaseFloat * (1 + porcentaje / 100));
-    const IVA = 0.21;
-    const precioFinalConIVA = parseFloat((precioFinal * (1 + IVA)).toFixed(2));
+    const precioFinalConIVA = calcularPrecioFinal(infoStock.price);
 
     const shopifyPayload = {
         input: {
@@ -326,72 +377,102 @@ export async function transformToShopifyJSONL(
 }
 // Procesamiento de los lotes de SKUs
 
-export async function processSKUs(): Promise<BunFile> {
+export async function processSKUs(): Promise<{ file: BunFile, deleteFile: BunFile | null }> {
     const outputFile = Bun.file(`shopify_bulk_update_${new Date(Date.now()).toISOString()}.jsonl`);
     const writer = outputFile.writer();
+    // IDs de productos existentes sin stock en Astelav
+    const idsABorrar: string[] = [];
     // Descargamos los datos existentes de shopify
     console.log("Descargando datos de Shopify");
     const productosExistentes = await obtenerMapaProductos();
 
-    for await (const skusPage of getChangedSKUs()) {
-        // Limpiamos duplicados
-        const skusUnicos = [...new Set(skusPage)]
-        // Lotes de 300 para exprimir la API de Astelav
-        const batches = chunkBatch(skusUnicos, 300);
-        console.log(`[DEBUG] Procesando lote de ${batches.length} SKUs`);
-        for (const batch of batches) {
-            try {
-                // Ordenamos el lote para que los que necesiten imagenes vaya lo ultimo
-                batch.sort((a, b) => {
-                    const aExiste = productosExistentes.has(a);
-                    const bExiste = productosExistentes.has(b);
+    // Procesa un lote: existentes -> solo precio/stock, nuevos -> producto completo
+    const procesarLote = async (batch: string[]) => {
+        try {
+            // Pedimos los precios y stock de los 300 SKUs
+            const stockDataMassive = await getBatchStockData(batch) as AstelavStockResponse | null;
 
-                    if (aExiste && !bExiste) return -1; // a va primero
-                    if (!aExiste && bExiste) return 1; // b va primero
-                    return 0; // se queda igual
-                })
+            // Si la API falla masivamente, saltamos el lote para no escribir basura
+            if (!stockDataMassive) return;
 
-                // Pedimos los precios y stock de los 300 SKUs
-                const stockDataMassive = await getBatchStockData(batch as string[]);
+            // Solo los nuevos necesitan los textos del endpoint search
+            const nuevos = batch.filter(sku => !productosExistentes.has(sku));
+            const searchDataArray = await Promise.all(nuevos.map(sku => getProductDetails(sku)));
+            const searchPorSku = new Map(nuevos.map((sku, i) => [sku, searchDataArray[i]]));
 
-                // Si la API falla masivamente, saltamos el lote para no escribir basura
-                if (!stockDataMassive) continue;
-
-                // Pedimos los detalles (textos) de forma concurrente para los 300
-                const searchPromises = batch.map(sku => getProductDetails(sku as string));
-                const searchDataArray = await Promise.all(searchPromises);
-
-                // Cruzamos la información y escribimos en el JSONL
-                for (let index = 0; index < batch.length; index++) {
-                    const sku = batch[index];
-                    const searchDetail = searchDataArray[index];
-                    // Buscamos si el SKU ya esta
-                    const datosExistentes = productosExistentes.get(sku);
-
-                    const shopifyData = await transformToShopifyJSONL(
-                        sku as string,
-                        searchDetail as AstelavSearchResponse,
-                        stockDataMassive as AstelavStockResponse,
-                        datosExistentes
-                    );
-
-                    console.log(`[DEBUG] SKU: ${sku} details: ${JSON.stringify(searchDetail)}`);
-
-                    if (shopifyData) {
-                        writer.write(shopifyData + '\n');
-                    } else {
-                        // Debug opcional si un producto no tiene ambos datos
-                        console.log(`[DEBUG] Datos incompletos para SKU: ${sku}`);
+            // Cruzamos la información y escribimos en el JSONL
+            for (const sku of batch) {
+                const datosExistentes = productosExistentes.get(sku);
+                if (datosExistentes) {
+                    // Producto propio de la tienda (fuera de la coleccion de Astelav): ni se actualiza ni se borra
+                    if (!datosExistentes.astelav) {
+                        console.log(`[DEBUG] ${sku} existe fuera de la coleccion de Astelav, se ignora`);
+                        continue;
+                    }
+                    const infoStock = stockDataMassive[sku];
+                    // Si Astelav no devuelve el SKU no tocamos nada: nunca borrar por una respuesta incompleta
+                    if (!infoStock) {
+                        console.log(`[WARN] Astelav no devolvio datos para ${sku}, se deja como esta`);
+                        continue;
+                    }
+                    // Sin stock o descatalogado en Astelav -> se borra de Shopify
+                    if (!infoStock.found || limpiarStock(infoStock) <= 0) {
+                        idsABorrar.push(datosExistentes.productId);
+                        continue;
                     }
                 }
-            } catch (error) {
-                console.error(`[${new Date(Date.now()).toISOString()}] Fallo al procesar lote: ${error}`);
+
+                const shopifyData = datosExistentes
+                    ? transformStockUpdateJSONL(sku, stockDataMassive, datosExistentes)
+                    : await transformToShopifyJSONL(sku, searchPorSku.get(sku) as AstelavSearchResponse, stockDataMassive);
+
+                if (shopifyData) {
+                    writer.write(shopifyData + '\n');
+                } else {
+                    // Nuevo sin datos completos, sin stock o no a la venta
+                    console.log(`[DEBUG] Producto nuevo descartado: ${sku}`);
+                }
             }
+        } catch (error) {
+            console.error(`[${new Date(Date.now()).toISOString()}] Fallo al procesar lote: ${error}`);
         }
         writer.flush();
+    };
+
+    // 1. SKUs cambiados en Astelav (incluye los nuevos a crear)
+    const procesados = new Set<string>();
+    for await (const skusPage of getChangedSKUs()) {
+        if (procesados.size >= MAX_SKUS) break;
+        const skusUnicos = [...new Set(skusPage as string[])]
+            .filter(sku => !procesados.has(sku))
+            .slice(0, MAX_SKUS - procesados.size);
+        skusUnicos.forEach(sku => procesados.add(sku));
+        // Lotes de 300 para exprimir la API de Astelav
+        for (const batch of chunkBatch(skusUnicos, 300)) await procesarLote(batch);
     }
+
+    // 2. Resto de productos ya en Shopify: precio y stock se refrescan en cada pasada
+    // ponytail: refresca todo el catalogo existente cada pasada (1 POST por 300 SKUs); si escala mal, limitar a cambiados
+    const astelavExistentes = [...productosExistentes].filter(([, d]) => d.astelav).map(([sku]) => sku);
+    const restantes = astelavExistentes.filter(sku => !procesados.has(sku)).slice(0, MAX_SKUS);
+    console.log(`[INFO] Actualizando precio/stock de ${restantes.length} productos existentes no cambiados`);
+    for (const batch of chunkBatch(restantes, 300)) await procesarLote(batch);
+
     writer.end();
     console.log(`[${new Date(Date.now()).toISOString()}] Proceso completado. Archivo generado: ${outputFile.name}`);
-    return outputFile;
+
+    // Freno de seguridad: si Astelav devuelve basura (todo a 0) no vaciamos la tienda
+    // ponytail: umbral fijo del 50%, hacerlo configurable si el catalogo rota mucho
+    if (idsABorrar.length > astelavExistentes.length * 0.5) {
+        console.error(`[ERROR] Se iban a borrar ${idsABorrar.length} de ${astelavExistentes.length} productos de Astelav (>50%). Borrado cancelado, revisar Astelav.`);
+        return { file: outputFile, deleteFile: null };
+    }
+    if (idsABorrar.length === 0) return { file: outputFile, deleteFile: null };
+
+    // Se conserva en disco como registro de lo borrado
+    const deleteFile = Bun.file(`shopify_bulk_delete_${new Date(Date.now()).toISOString()}.jsonl`);
+    await Bun.write(deleteFile, idsABorrar.map(id => JSON.stringify({ input: { id } })).join('\n'));
+    console.log(`[INFO] ${idsABorrar.length} productos sin stock a borrar. Archivo: ${deleteFile.name}`);
+    return { file: outputFile, deleteFile };
 }
 

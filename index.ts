@@ -1,4 +1,4 @@
-import { subirArchivoShopify, vigilarOperacion, verErroresBulk } from "./modules/staged_upload";
+import { subirArchivoShopify, vigilarOperacion, verErroresBulk, PRODUCT_DELETE_MUTATION } from "./modules/staged_upload";
 import { processSKUs } from "./modules/batch_processing";
 import { publicarProductosBulk } from "./modules/publish";
 
@@ -7,7 +7,7 @@ async function main() {
     let publishingFile: string | null = null;
     try {
         // Creacion y actualizacion de los productos
-        const file = await processSKUs();
+        const { file, deleteFile } = await processSKUs();
 
         const bulkId = await subirArchivoShopify(file.name!);
         await vigilarOperacion(bulkId);
@@ -16,6 +16,14 @@ async function main() {
         // Publicacion
         console.log(`[${new Date(Date.now()).toISOString()}] [INFO] Publicando`)
         publishingFile = await publicarProductosBulk(bulkId);
+
+        // Borrado de productos sin stock (despues: Shopify solo admite un bulk mutation a la vez)
+        if (deleteFile) {
+            console.log(`[${new Date(Date.now()).toISOString()}] [INFO] Borrando productos sin stock`)
+            const deleteBulkId = await subirArchivoShopify(deleteFile.name!, PRODUCT_DELETE_MUTATION);
+            await vigilarOperacion(deleteBulkId);
+            await verErroresBulk(deleteBulkId);
+        }
     } catch (error) {
         console.error(`[${new Date(Date.now()).toISOString()}] Error fatal: ${error}`);
         process.exit(1);
